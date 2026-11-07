@@ -25,6 +25,12 @@ _<kbd>[Super]</kbd> is typically the <kbd>Windows</kbd> or <kbd>Cmd</kbd> key._
  | ------------------------------------------- |:-----------------------------
  | Quit                                        | <kbd>MOD</kbd>+<kbd>q</kbd>
  | Switch fullscreen mode                      | <kbd>MOD</kbd>+<kbd>f</kbd> \| <kbd>F11</kbd>
+ | Toggle picture-in-picture mode              | <kbd>MOD</kbd>+<kbd>u</kbd>
+ | Lock/unlock PiP position and resizing        | <kbd>MOD</kbd>+<kbd>l</kbd>
+ | Toggle always-on-top                         | <kbd>MOD</kbd>+<kbd>a</kbd>
+ | Toggle click-through mode (Windows)          | <kbd>MOD</kbd>+<kbd>Shift</kbd>+<kbd>p</kbd>
+ | Set window width to 720 pixels                | <kbd>MOD</kbd>+<kbd>5</kbd>
+ | Set window width to 1080 pixels               | <kbd>MOD</kbd>+<kbd>6</kbd>
  | Rotate display left                         | <kbd>MOD</kbd>+<kbd>←</kbd> _(left)_
  | Rotate display right                        | <kbd>MOD</kbd>+<kbd>→</kbd> _(right)_
  | Flip display horizontally                   | <kbd>MOD</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd> _(left)_ \| <kbd>MOD</kbd>+<kbd>Shift</kbd>+<kbd>→</kbd> _(right)_
@@ -69,6 +75,9 @@ _²Right-click turns the screen on if it was off, presses BACK otherwise._
 _³4th and 5th mouse buttons, if your mouse has them._  
 _⁴For react-native apps in development, `MENU` triggers development menu._  
 _⁵Only on Android >= 7._
+
+The PiP window position and size are saved in `pip_config.txt` in the current
+working directory when leaving PiP or closing scrcpy while PiP is active.
 
 Shortcuts with repeated keys are executed by releasing and pressing the key a
 second time. For example, to execute "Expand settings panel":

@@ -22,11 +22,23 @@
 #include "trait/key_processor.h"
 #include "trait/frame_sink.h"
 #include "trait/mouse_processor.h"
+#include "util/intr.h"
 #include "util/thread.h"
 
 #ifdef __APPLE__
 # define SC_DISPLAY_FORCE_OPENGL_CORE_PROFILE
 #endif
+
+struct sc_title_monitor {
+    sc_thread thread;
+    sc_mutex mutex;
+    sc_cond cond;
+    struct sc_intr intr;
+    bool initialized;
+    bool thread_started;
+    bool stopped;
+    int battery_level;
+};
 
 struct sc_screen {
     struct sc_frame_sink frame_sink; // frame sink trait
@@ -90,6 +102,23 @@ struct sc_screen {
     struct SDL_FRect rect;
     bool window_shown;
 
+    bool pip_active;
+    bool pip_locked;
+    struct sc_size pip_window_size;
+    struct sc_point pip_window_position;
+    bool pip_was_borderless;
+    bool pip_was_always_on_top;
+    bool pip_hit_test_active;
+    bool click_through_active;
+    uintptr_t click_through_original_ex_style;
+
+    const char *serial;
+    const char *window_title;
+    struct sc_title_monitor title_monitor;
+    uint64_t title_last_update;
+    unsigned title_frame_count;
+    unsigned title_fps;
+
     // only accessed from the thread calling sc_frame_sink_ops functions
     struct sc_stream_session current_session;
 
@@ -119,6 +148,7 @@ struct sc_screen_params {
     bool flex_display;
 
     struct sc_controller *controller;
+    const char *serial;
     struct sc_file_pusher *fp;
     struct sc_key_processor *kp;
     struct sc_mouse_processor *mp;
@@ -179,6 +209,26 @@ sc_screen_hide_window(struct sc_screen *screen);
 // toggle the fullscreen mode
 void
 sc_screen_toggle_fullscreen(struct sc_screen *screen);
+
+// toggle the picture-in-picture mode
+void
+sc_screen_toggle_pip(struct sc_screen *screen);
+
+// toggle PiP lock mode
+void
+sc_screen_toggle_pip_lock(struct sc_screen *screen);
+
+// toggle mouse click-through mode (supported on Windows)
+void
+sc_screen_toggle_click_through(struct sc_screen *screen);
+
+// set the window width while preserving the current video aspect ratio
+void
+sc_screen_set_quick_resolution(struct sc_screen *screen, int width);
+
+// update the window title with device battery and rendered FPS
+void
+sc_screen_update_title(struct sc_screen *screen);
 
 // resize window to optimal size (remove black borders)
 void

@@ -15,6 +15,13 @@
 #include "trait/key_processor.h"
 #include "trait/mouse_processor.h"
 
+enum sc_pip_button {
+    SC_PIP_BUTTON_NONE,
+    SC_PIP_BUTTON_HOME,
+    SC_PIP_BUTTON_BACK,
+    SC_PIP_BUTTON_APP_SWITCH,
+};
+
 struct sc_input_manager {
     struct sc_controller *controller;
     struct sc_file_pusher *fp;
@@ -37,6 +44,7 @@ struct sc_input_manager {
     bool vfinger_invert_y;
 
     uint8_t mouse_buttons_state; // OR of enum sc_mouse_button values
+    enum sc_pip_button pip_button;
 
     // Tracks the number of identical consecutive shortcut key down events.
     // Not to be confused with event->repeat, which counts the number of

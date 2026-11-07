@@ -1,18 +1,186 @@
 #include "screen.h"
 
 #include <assert.h>
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+# include <winsock2.h>
+# include <windows.h>
+#endif
 #include <SDL3/SDL.h>
 
+#include "adb/adb.h"
 #include "events.h"
 #include "icon.h"
 #include "options.h"
 #include "util/log.h"
+#include "util/process.h"
+#include "util/process_intr.h"
 #include "util/sdl.h"
 
 #define DISPLAY_MARGINS 96
 
 #define DOWNCAST(SINK) container_of(SINK, struct sc_screen, frame_sink)
+
+static void
+sc_screen_save_pip_state(struct sc_screen *screen);
+
+static int
+sc_screen_read_battery_level(struct sc_screen *screen) {
+    const char *const argv[] = {
+        sc_adb_get_executable(), "-s", screen->serial,
+        "shell", "dumpsys", "battery", NULL,
+    };
+
+    sc_pid pid;
+    sc_pipe pout;
+    enum sc_process_result result =
+        sc_process_execute_p(argv, &pid, SC_PROCESS_NO_STDERR,
+                             NULL, &pout, NULL);
+    if (result != SC_PROCESS_SUCCESS) {
+        LOGW("Could not start adb battery query");
+        return -1;
+    }
+
+    char output[4096];
+    size_t len = 0;
+    bool read_ok = true;
+    for (;;) {
+        char extra[512];
+        char *buf;
+        size_t cap;
+        if (len < sizeof(output) - 1) {
+            buf = output + len;
+            cap = sizeof(output) - 1 - len;
+        } else {
+            buf = extra;
+            cap = sizeof(extra);
+        }
+
+        ssize_t n = sc_pipe_read_intr(&screen->title_monitor.intr, pid,
+                                      pout, buf, cap);
+        if (n < 0) {
+            read_ok = false;
+            break;
+        }
+        if (!n) {
+            break;
+        }
+        if (len < sizeof(output) - 1) {
+            len += n;
+        }
+    }
+
+    sc_pipe_close(pout);
+    sc_exit_code exit_code = sc_process_wait(pid, true);
+    if (!read_ok || exit_code) {
+        return -1;
+    }
+    output[len] = '\0';
+
+    const char *level = strstr(output, "level:");
+    if (!level) {
+        LOGD("Could not find battery level in adb output");
+        return -1;
+    }
+
+    errno = 0;
+    char *end;
+    long value = strtol(level + sizeof("level:") - 1, &end, 10);
+    if (end == level + sizeof("level:") - 1 || errno == ERANGE
+            || value < 0 || value > 100) {
+        LOGD("Invalid battery level in adb output");
+        return -1;
+    }
+
+    return value;
+}
+
+static int
+sc_screen_run_title_monitor(void *data) {
+    struct sc_screen *screen = data;
+    struct sc_title_monitor *monitor = &screen->title_monitor;
+
+    for (;;) {
+        sc_mutex_lock(&monitor->mutex);
+        bool stopped = monitor->stopped;
+        sc_mutex_unlock(&monitor->mutex);
+        if (stopped) {
+            break;
+        }
+
+        int battery_level = sc_screen_read_battery_level(screen);
+        if (battery_level >= 0) {
+            sc_mutex_lock(&monitor->mutex);
+            if (!monitor->stopped) {
+                monitor->battery_level = battery_level;
+            }
+            stopped = monitor->stopped;
+            sc_mutex_unlock(&monitor->mutex);
+
+            if (!stopped) {
+                sc_push_event(SC_EVENT_UPDATE_TITLE);
+            }
+        }
+
+        sc_mutex_lock(&monitor->mutex);
+        if (!monitor->stopped) {
+            sc_tick deadline = sc_tick_now() + SC_TICK_FROM_SEC(15);
+            sc_cond_timedwait(&monitor->cond, &monitor->mutex, deadline);
+        }
+        stopped = monitor->stopped;
+        sc_mutex_unlock(&monitor->mutex);
+        if (stopped) {
+            break;
+        }
+    }
+
+    return 0;
+}
+
+static void
+sc_screen_start_title_monitor(struct sc_screen *screen) {
+    struct sc_title_monitor *monitor = &screen->title_monitor;
+    monitor->battery_level = -1;
+
+    if (!screen->serial) {
+        return;
+    }
+
+    if (!sc_mutex_init(&monitor->mutex)) {
+        LOGW("Could not initialize title monitor mutex");
+        return;
+    }
+    if (!sc_cond_init(&monitor->cond)) {
+        LOGW("Could not initialize title monitor condition");
+        sc_mutex_destroy(&monitor->mutex);
+        return;
+    }
+    if (!sc_intr_init(&monitor->intr)) {
+        LOGW("Could not initialize title monitor interruptor");
+        sc_cond_destroy(&monitor->cond);
+        sc_mutex_destroy(&monitor->mutex);
+        return;
+    }
+
+    monitor->initialized = true;
+    monitor->stopped = false;
+    if (!sc_thread_create(&monitor->thread, sc_screen_run_title_monitor,
+                          "scrcpy-title", screen)) {
+        LOGW("Could not start title monitor thread");
+        sc_intr_destroy(&monitor->intr);
+        sc_cond_destroy(&monitor->cond);
+        sc_mutex_destroy(&monitor->mutex);
+        monitor->initialized = false;
+        return;
+    }
+
+    monitor->thread_started = true;
+}
 
 static void
 set_aspect_ratio(struct sc_screen *screen, struct sc_size content_size) {
@@ -340,6 +508,135 @@ sc_screen_render(struct sc_screen *screen, bool update_content_rect) {
     }
 
 end:
+    if (screen->pip_active) {
+        if (screen->controller) {
+            float scale = SDL_GetWindowPixelDensity(screen->window);
+            int width;
+            int height;
+            if (scale > 0 && SDL_GetWindowSizeInPixels(screen->window,
+                                                       &width, &height)
+                    && width > 0 && height >= (int) (40 * scale)) {
+                SDL_BlendMode old_blend_mode;
+                bool got_blend_mode =
+                    SDL_GetRenderDrawBlendMode(renderer, &old_blend_mode);
+                bool ok = got_blend_mode
+                        && SDL_SetRenderDrawBlendMode(renderer,
+                                                      SDL_BLENDMODE_BLEND);
+                if (ok) {
+                    for (int i = 0; i < 3; ++i) {
+                        SDL_FRect button = {
+                            .x = i * width / 3.f,
+                            .y = 0,
+                            .w = width / 3.f,
+                            .h = 40 * scale,
+                        };
+                        ok = SDL_SetRenderDrawColor(renderer, 0, 0, 0, 150)
+                          && SDL_RenderFillRect(renderer, &button);
+                        if (!ok) {
+                            break;
+                        }
+                    }
+
+                    if (ok) {
+                        float x[3] = {
+                            width / 6.f,
+                            width / 2.f,
+                            width * 5.f / 6.f,
+                        };
+                        float y = 20 * scale;
+                        float radius = 7 * scale;
+                        ok = SDL_SetRenderDrawColor(renderer, 255, 255, 255,
+                                                    220);
+                        if (ok) {
+                            ok = SDL_RenderLine(renderer,
+                                                x[0] - radius, y + radius,
+                                                x[0] - radius, y)
+                              && SDL_RenderLine(renderer,
+                                                x[0] - radius, y,
+                                                x[0], y - radius)
+                              && SDL_RenderLine(renderer,
+                                                x[0], y - radius,
+                                                x[0] + radius, y)
+                              && SDL_RenderLine(renderer,
+                                                x[0] + radius, y,
+                                                x[0] + radius, y + radius)
+                              && SDL_RenderLine(renderer,
+                                                x[0] + radius, y + radius,
+                                                x[0] - radius, y + radius);
+                        }
+                        if (ok) {
+                            ok = SDL_RenderLine(renderer,
+                                                x[1] + radius, y - radius,
+                                                x[1] - radius, y)
+                              && SDL_RenderLine(renderer,
+                                                x[1] - radius, y,
+                                                x[1] + radius, y + radius)
+                              && SDL_RenderLine(renderer,
+                                                x[1] - radius, y,
+                                                x[1] + radius * 2, y);
+                        }
+                        if (ok) {
+                            SDL_FRect first = {
+                                .x = x[2] - radius,
+                                .y = y - radius,
+                                .w = 2 * radius,
+                                .h = 2 * radius,
+                            };
+                            SDL_FRect second = {
+                                .x = x[2] - radius / 2,
+                                .y = y - radius / 2,
+                                .w = 2 * radius,
+                                .h = 2 * radius,
+                            };
+                            ok = SDL_RenderRect(renderer, &first)
+                              && SDL_RenderRect(renderer, &second);
+                        }
+                    }
+
+                    if (!ok) {
+                        LOGW("Could not render PiP button overlay: %s",
+                             SDL_GetError());
+                    }
+
+                    if (!SDL_SetRenderDrawBlendMode(renderer, old_blend_mode)) {
+                        LOGW("Could not restore renderer blend mode: %s",
+                             SDL_GetError());
+                    }
+                } else {
+                    LOGW("Could not configure PiP button overlay: %s",
+                         SDL_GetError());
+                }
+            }
+        }
+
+        int width;
+        int height;
+        if (SDL_GetWindowSizeInPixels(screen->window, &width, &height)) {
+            if (width > 2 && height > 2) {
+                SDL_FRect border_rect = {
+                    .x = 1.f,
+                    .y = 1.f,
+                    .w = width - 2.f,
+                    .h = height - 2.f,
+                };
+                bool ok = SDL_SetRenderDrawColor(renderer,
+                                                 screen->pip_locked ? 255 : 0,
+                                                 screen->pip_locked ? 0 : 255,
+                                                 0, 255);
+                if (!ok) {
+                    LOGW("Could not set PiP border color: %s", SDL_GetError());
+                } else {
+                    ok = SDL_RenderRect(renderer, &border_rect);
+                    if (!ok) {
+                        LOGW("Could not render PiP border: %s", SDL_GetError());
+                    }
+                }
+            }
+        } else {
+            LOGW("Could not get PiP window pixel size: %s", SDL_GetError());
+        }
+    }
+
     sc_sdl_render_present(renderer);
 }
 
@@ -526,13 +823,25 @@ sc_screen_init(struct sc_screen *screen,
     screen->orientation = SC_ORIENTATION_0;
     screen->disconnected = false;
     screen->disconnect_started = false;
+    screen->pip_active = false;
+    screen->pip_locked = false;
+    screen->pip_hit_test_active = false;
+    screen->click_through_active = false;
+    screen->click_through_original_ex_style = 0;
+    screen->serial = params->serial;
+    screen->window_title = params->window_title;
+    screen->title_monitor.initialized = false;
+    screen->title_monitor.thread_started = false;
+    screen->title_monitor.battery_level = -1;
+    screen->title_last_update = SDL_GetTicks();
+    screen->title_frame_count = 0;
+    screen->title_fps = 0;
 
     screen->video = params->video;
     screen->camera = params->camera;
     screen->window_aspect_ratio_lock = params->window_aspect_ratio_lock;
     screen->render_fit = params->render_fit;
     screen->flex_display = params->flex_display;
-
     screen->bg.r = (params->background_color >> 16) & 0xFF;
     screen->bg.g = (params->background_color >> 8) & 0xFF;
     screen->bg.b = params->background_color & 0xFF;
@@ -746,6 +1055,8 @@ sc_screen_init(struct sc_screen *screen,
         }
     }
 
+    sc_screen_start_title_monitor(screen);
+
     return true;
 
 error_destroy_texture:
@@ -819,6 +1130,15 @@ sc_screen_hide_window(struct sc_screen *screen) {
 void
 sc_screen_interrupt(struct sc_screen *screen) {
     sc_fps_counter_interrupt(&screen->fps_counter);
+
+    struct sc_title_monitor *monitor = &screen->title_monitor;
+    if (monitor->initialized) {
+        sc_mutex_lock(&monitor->mutex);
+        monitor->stopped = true;
+        sc_mutex_unlock(&monitor->mutex);
+        sc_cond_signal(&monitor->cond);
+        sc_intr_interrupt(&monitor->intr);
+    }
 }
 
 static void
@@ -831,6 +1151,17 @@ sc_screen_interrupt_disconnect(struct sc_screen *screen) {
 void
 sc_screen_join(struct sc_screen *screen) {
     sc_fps_counter_join(&screen->fps_counter);
+    struct sc_title_monitor *monitor = &screen->title_monitor;
+    if (monitor->thread_started) {
+        sc_thread_join(&monitor->thread, NULL);
+        monitor->thread_started = false;
+    }
+
+    SDL_Event event;
+    while (sc_dequeue_event(SC_EVENT_UPDATE_TITLE, &event)) {
+        // Discard pending title updates before destroying the screen.
+    }
+
     if (screen->disconnect_started) {
         sc_disconnect_join(&screen->disconnect);
     }
@@ -841,6 +1172,16 @@ sc_screen_destroy(struct sc_screen *screen) {
 #ifndef NDEBUG
     assert(!screen->open);
 #endif
+    if (screen->title_monitor.initialized) {
+        sc_intr_destroy(&screen->title_monitor.intr);
+        sc_cond_destroy(&screen->title_monitor.cond);
+        sc_mutex_destroy(&screen->title_monitor.mutex);
+    }
+
+    if (screen->pip_active) {
+        sc_screen_save_pip_state(screen);
+    }
+
     if (screen->disconnect_started) {
         sc_disconnect_destroy(&screen->disconnect);
     }
@@ -987,6 +1328,7 @@ sc_screen_apply_frame(struct sc_screen *screen, bool can_resize) {
         return false;
     }
 
+    ++screen->title_frame_count;
     sc_screen_render(screen, false);
     return true;
 }
@@ -1066,6 +1408,432 @@ sc_screen_toggle_fullscreen(struct sc_screen *screen) {
     }
 
     LOGD("Requested %s mode", req_fullscreen ? "fullscreen" : "windowed");
+}
+
+static SDL_HitTestResult SDLCALL
+pip_hit_test(SDL_Window *window, const SDL_Point *area, void *data) {
+    struct sc_screen *screen = data;
+
+    if (!screen || !area) {
+        return SDL_HITTEST_NORMAL;
+    }
+
+    if (screen->pip_locked) {
+        return SDL_HITTEST_NORMAL;
+    }
+
+    int width;
+    int height;
+    if (!SDL_GetWindowSize(window, &width, &height)) {
+        return SDL_HITTEST_NORMAL;
+    }
+
+    const int border = 8;
+    if (width <= 2 * border || height <= 2 * border) {
+        return SDL_HITTEST_NORMAL;
+    }
+
+    bool top = area->y < border;
+    bool bottom = area->y >= height - border;
+    bool left = area->x < border;
+    bool right = area->x >= width - border;
+
+    if (top && left) {
+        return SDL_HITTEST_RESIZE_TOPLEFT;
+    }
+    if (top && right) {
+        return SDL_HITTEST_RESIZE_TOPRIGHT;
+    }
+    if (bottom && left) {
+        return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+    }
+    if (bottom && right) {
+        return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+    }
+    if (top) {
+        return SDL_HITTEST_RESIZE_TOP;
+    }
+    if (bottom) {
+        return SDL_HITTEST_RESIZE_BOTTOM;
+    }
+    if (left) {
+        return SDL_HITTEST_RESIZE_LEFT;
+    }
+    if (right) {
+        return SDL_HITTEST_RESIZE_RIGHT;
+    }
+    if (screen->pip_active && area->y >= 40 && area->y < 70) {
+        return SDL_HITTEST_DRAGGABLE;
+    }
+
+    return SDL_HITTEST_NORMAL;
+}
+
+static void
+sc_screen_save_pip_state(struct sc_screen *screen) {
+    int x;
+    int y;
+    int width;
+    int height;
+    if (!SDL_GetWindowPosition(screen->window, &x, &y)
+            || !SDL_GetWindowSize(screen->window, &width, &height)) {
+        LOGW("Could not get PiP window geometry: %s", SDL_GetError());
+        return;
+    }
+
+    FILE *file = fopen("pip_config.txt", "w");
+    if (!file) {
+        LOGW("Could not open pip_config.txt for writing: %s",
+             strerror(errno));
+        return;
+    }
+
+    bool ok = fprintf(file, "%d %d %d %d\n", x, y, width, height) >= 0;
+    if (fclose(file) != 0) {
+        ok = false;
+    }
+
+    if (!ok) {
+        LOGW("Could not save PiP state to pip_config.txt: %s",
+             strerror(errno));
+        return;
+    }
+
+    LOGD("Saved PiP state: %dx%d at %d,%d", width, height, x, y);
+}
+
+static void
+sc_screen_load_pip_state(struct sc_screen *screen) {
+    FILE *file = fopen("pip_config.txt", "r");
+    if (!file) {
+        if (errno != ENOENT) {
+            LOGW("Could not open pip_config.txt for reading: %s",
+                 strerror(errno));
+        }
+        return;
+    }
+
+    char line[256];
+    bool valid = fgets(line, sizeof(line), file) != NULL;
+    if (valid && !strchr(line, '\n') && !feof(file)) {
+        valid = false;
+    }
+
+    long values[4];
+    char *cursor = line;
+    for (unsigned i = 0; valid && i < ARRAY_LEN(values); ++i) {
+        while (isspace((unsigned char) *cursor)) {
+            ++cursor;
+        }
+
+        errno = 0;
+        char *end;
+        long value = strtol(cursor, &end, 10);
+        if (end == cursor || errno == ERANGE
+                || value < INT_MIN || value > INT_MAX) {
+            valid = false;
+        } else {
+            values[i] = value;
+            cursor = end;
+        }
+    }
+
+    while (valid && isspace((unsigned char) *cursor)) {
+        ++cursor;
+    }
+    if (valid && *cursor) {
+        valid = false;
+    }
+
+    int close_result = fclose(file);
+    if (!valid || close_result != 0
+            || values[2] <= 0 || values[3] <= 0
+            || values[2] > 32768 || values[3] > 32768) {
+        LOGW("Ignoring invalid PiP state in pip_config.txt");
+        return;
+    }
+
+    int x = values[0];
+    int y = values[1];
+    int width = values[2];
+    int height = values[3];
+
+    bool ok = SDL_SetWindowSize(screen->window, width, height);
+    if (!ok) {
+        LOGW("Could not restore PiP window size: %s", SDL_GetError());
+    }
+
+    ok = SDL_SetWindowPosition(screen->window, x, y);
+    if (!ok) {
+        LOGW("Could not restore PiP window position: %s", SDL_GetError());
+    }
+
+    LOGD("Loaded PiP state: %dx%d at %d,%d", width, height, x, y);
+}
+
+void
+sc_screen_toggle_pip(struct sc_screen *screen) {
+    assert(screen->video);
+
+    if (!screen->pip_active && !is_windowed(screen)) {
+        LOGW("Cannot enable PiP while fullscreen, maximized, or minimized");
+        return;
+    }
+
+    if (screen->pip_active) {
+        sc_screen_save_pip_state(screen);
+
+        bool ok;
+        if (screen->pip_hit_test_active) {
+            ok = SDL_SetWindowHitTest(screen->window, NULL, NULL);
+            if (!ok) {
+                LOGW("Could not disable PiP window hit test: %s",
+                     SDL_GetError());
+            } else {
+                screen->pip_hit_test_active = false;
+            }
+        }
+
+        ok = SDL_SetWindowAlwaysOnTop(screen->window,
+                                      screen->pip_was_always_on_top);
+        if (!ok) {
+            LOGW("Could not restore window always-on-top state: %s",
+                 SDL_GetError());
+        }
+
+        ok = SDL_SetWindowBordered(screen->window,
+                                   !screen->pip_was_borderless);
+        if (!ok) {
+            LOGW("Could not restore window border state: %s", SDL_GetError());
+        }
+
+        sc_sdl_set_window_size(screen->window, screen->pip_window_size);
+        sc_sdl_set_window_position(screen->window,
+                                   screen->pip_window_position);
+        if (screen->window_aspect_ratio_lock) {
+            set_aspect_ratio(screen, screen->content_size);
+        } else {
+            ok = SDL_SetWindowAspectRatio(screen->window, 0, 0);
+            if (!ok) {
+                LOGW("Could not restore window aspect ratio: %s",
+                     SDL_GetError());
+            }
+        }
+
+        screen->pip_active = false;
+        screen->pip_locked = false;
+        LOGI("Picture-in-Picture: OFF");
+        return;
+    }
+
+    if (!screen->content_size.width || !screen->content_size.height) {
+        LOGW("Cannot enable PiP before the video size is known");
+        return;
+    }
+
+    screen->pip_window_size = sc_sdl_get_window_size(screen->window);
+    screen->pip_window_position = sc_sdl_get_window_position(screen->window);
+
+    SDL_WindowFlags flags = SDL_GetWindowFlags(screen->window);
+    screen->pip_was_borderless = flags & SDL_WINDOW_BORDERLESS;
+    screen->pip_was_always_on_top = flags & SDL_WINDOW_ALWAYS_ON_TOP;
+
+    bool ok = SDL_SetWindowAlwaysOnTop(screen->window, true);
+    if (!ok) {
+        LOGW("Could not set window always on top: %s", SDL_GetError());
+    }
+
+    ok = SDL_SetWindowBordered(screen->window, false);
+    if (!ok) {
+        LOGW("Could not remove window border: %s", SDL_GetError());
+    }
+
+    ok = SDL_SetWindowHitTest(screen->window, pip_hit_test, screen);
+    if (!ok) {
+        LOGW("Could not enable PiP window hit test: %s", SDL_GetError());
+    } else {
+        screen->pip_hit_test_active = true;
+    }
+
+    struct sc_size max_size = {
+        .width = 400,
+        .height = 400,
+    };
+    struct sc_size pip_size =
+        get_optimal_size(max_size, screen->content_size, false);
+    sc_sdl_set_window_size(screen->window, pip_size);
+
+    struct sc_point pip_position = {
+        .x = 50,
+        .y = 50,
+    };
+    sc_sdl_set_window_position(screen->window, pip_position);
+    sc_screen_load_pip_state(screen);
+
+    float aspect_ratio = (float) screen->content_size.width
+                       / screen->content_size.height;
+    ok = SDL_SetWindowAspectRatio(screen->window, aspect_ratio, aspect_ratio);
+    if (!ok) {
+        LOGW("Could not lock PiP window aspect ratio: %s", SDL_GetError());
+    }
+
+    screen->pip_active = true;
+    LOGI("Picture-in-Picture: ON");
+}
+
+void
+sc_screen_toggle_pip_lock(struct sc_screen *screen) {
+    if (!screen->pip_active) {
+        return;
+    }
+
+    screen->pip_locked = !screen->pip_locked;
+    LOGI("Picture-in-Picture: Locked = %s",
+         screen->pip_locked ? "true" : "false");
+}
+
+void
+sc_screen_toggle_click_through(struct sc_screen *screen) {
+#ifdef _WIN32
+    SDL_PropertiesID props = SDL_GetWindowProperties(screen->window);
+    HWND hwnd = SDL_GetPointerProperty(props,
+                                       SDL_PROP_WINDOW_WIN32_HWND_POINTER,
+                                       NULL);
+    if (!hwnd) {
+        LOGW("Could not get the native window handle for click-through mode");
+        return;
+    }
+
+    LONG_PTR style = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    if (!screen->click_through_active) {
+        screen->click_through_original_ex_style = (uintptr_t) style;
+        LONG_PTR new_style = style | WS_EX_TRANSPARENT | WS_EX_LAYERED;
+        SetLastError(0);
+        LONG_PTR previous = SetWindowLongPtr(hwnd, GWL_EXSTYLE, new_style);
+        if (!previous && GetLastError()) {
+            LOGW("Could not enable click-through mode");
+            return;
+        }
+
+        SetLastError(0);
+        if (!SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)) {
+            DWORD error = GetLastError();
+            SetWindowLongPtr(hwnd, GWL_EXSTYLE, style);
+            LOGW("Could not configure click-through window: %lu",
+                 (unsigned long) error);
+            return;
+        }
+
+        screen->click_through_active = true;
+    } else {
+        LONG_PTR original = (LONG_PTR) screen->click_through_original_ex_style;
+        LONG_PTR new_style =
+            (style & ~(WS_EX_TRANSPARENT | WS_EX_LAYERED))
+            | (original & (WS_EX_TRANSPARENT | WS_EX_LAYERED));
+        SetLastError(0);
+        LONG_PTR previous = SetWindowLongPtr(hwnd, GWL_EXSTYLE, new_style);
+        if (!previous && GetLastError()) {
+            LOGW("Could not disable click-through mode");
+            return;
+        }
+
+        screen->click_through_active = false;
+    }
+
+    if (!SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+                      | SWP_NOACTIVATE | SWP_FRAMECHANGED)) {
+        LOGW("Could not refresh the window style for click-through mode: %lu",
+             (unsigned long) GetLastError());
+    }
+    LOGI("Click-Through: %s",
+         screen->click_through_active ? "ON" : "OFF");
+#else
+    (void) screen;
+    LOGW("Click-through mode is not supported on this platform");
+#endif
+}
+
+void
+sc_screen_set_quick_resolution(struct sc_screen *screen, int width) {
+    assert(screen->video);
+
+    if (width <= 0 || !screen->content_size.width
+            || !screen->content_size.height) {
+        LOGW("Cannot set quick resolution before the video size is known");
+        return;
+    }
+
+    if (!is_windowed(screen)) {
+        LOGW("Cannot set quick resolution while fullscreen, maximized, "
+             "or minimized");
+        return;
+    }
+
+    if (screen->pip_active && screen->pip_locked) {
+        LOGW("Cannot resize a locked PiP window");
+        return;
+    }
+
+    int height = (int) ((int64_t) width * screen->content_size.height
+                      / screen->content_size.width);
+    if (height <= 0) {
+        LOGW("Invalid quick resolution height");
+        return;
+    }
+
+    bool ok = SDL_SetWindowSize(screen->window, width, height);
+    if (!ok) {
+        LOGW("Could not set quick resolution to %dx%d: %s",
+             width, height, SDL_GetError());
+        return;
+    }
+
+    LOGI("Window size set to %dx%d", width, height);
+}
+
+void
+sc_screen_update_title(struct sc_screen *screen) {
+    assert(sc_thread_is_main());
+
+    uint64_t now = SDL_GetTicks();
+    uint64_t elapsed = now - screen->title_last_update;
+    if (elapsed >= 1000) {
+        screen->title_fps =
+            (uint64_t) screen->title_frame_count * 1000 / elapsed;
+        screen->title_frame_count = 0;
+        screen->title_last_update = now;
+    }
+
+    int battery_level = -1;
+    struct sc_title_monitor *monitor = &screen->title_monitor;
+    if (monitor->initialized) {
+        sc_mutex_lock(&monitor->mutex);
+        battery_level = monitor->battery_level;
+        sc_mutex_unlock(&monitor->mutex);
+    }
+
+    char title[256];
+    int len;
+    if (battery_level >= 0) {
+        len = snprintf(title, sizeof(title),
+                       "%s | Battery: %d%% | FPS: %u",
+                       screen->window_title, battery_level,
+                       screen->title_fps);
+    } else {
+        len = snprintf(title, sizeof(title), "%s | FPS: %u",
+                       screen->window_title, screen->title_fps);
+    }
+
+    if (len < 0 || (size_t) len >= sizeof(title)) {
+        LOGW("Could not format window title");
+        return;
+    }
+
+    bool ok = SDL_SetWindowTitle(screen->window, title);
+    if (!ok) {
+        LOGW("Could not update window title: %s", SDL_GetError());
+    }
 }
 
 void
@@ -1193,9 +1961,14 @@ sc_screen_handle_event(struct sc_screen *screen, const SDL_Event *event) {
             bool ok = sc_screen_update_frame(screen);
             if (!ok) {
                 LOGE("Frame update failed\n");
+            } else if (SDL_GetTicks() - screen->title_last_update >= 2000) {
+                sc_screen_update_title(screen);
             }
             return;
         }
+        case SC_EVENT_UPDATE_TITLE:
+            sc_screen_update_title(screen);
+            return;
         case SDL_EVENT_WINDOW_EXPOSED:
             sc_screen_render(screen, true);
             return;

@@ -17,7 +17,6 @@
 void
 sc_input_manager_init(struct sc_input_manager *im,
                       const struct sc_input_manager_params *params) {
-    // A processor must have ops initialized
     assert(!params->kp || params->kp->ops);
     assert(!params->mp || params->mp->ops);
     assert(!params->gp || params->gp->ops);
@@ -41,6 +40,7 @@ sc_input_manager_init(struct sc_input_manager *im,
     im->vfinger_invert_y = false;
 
     im->mouse_buttons_state = 0;
+    im->pip_button = SC_PIP_BUTTON_NONE;
 
     im->last_keycode = SDLK_UNKNOWN;
     im->last_mod = 0;
@@ -56,7 +56,6 @@ send_keycode(struct sc_input_manager *im, enum android_keycode keycode,
              enum sc_action action, const char *name) {
     assert(im->controller && im->kp && !im->camera);
 
-    // send DOWN event
     struct sc_control_msg msg;
     msg.type = SC_CONTROL_MSG_TYPE_INJECT_KEYCODE;
     msg.inject_keycode.action = action == SC_ACTION_DOWN
@@ -106,8 +105,6 @@ action_menu(struct sc_input_manager *im, enum sc_action action) {
     send_keycode(im, AKEYCODE_MENU, action, "MENU");
 }
 
-// turn the screen on if it was off, press BACK otherwise
-// If the screen is off, it is turned on only on ACTION_DOWN
 static void
 press_back_or_turn_screen_on(struct sc_input_manager *im,
                              enum sc_action action) {
@@ -226,13 +223,10 @@ static void
 switch_fps_counter_state(struct sc_input_manager *im) {
     struct sc_fps_counter *fps_counter = &im->screen->fps_counter;
 
-    // the started state can only be written from the current thread, so there
-    // is no ToCToU issue
     if (sc_fps_counter_is_started(fps_counter)) {
         sc_fps_counter_stop(fps_counter);
     } else {
         sc_fps_counter_start(fps_counter);
-        // Any error is already logged
     }
 }
 
@@ -246,7 +240,6 @@ clipboard_paste(struct sc_input_manager *im) {
         return;
     }
     if (!*text) {
-        // empty text
         SDL_free(text);
         return;
     }
@@ -357,13 +350,11 @@ sc_input_manager_process_text_input(struct sc_input_manager *im,
     }
 
     if (!im->kp->ops->process_text) {
-        // The key processor does not support text input
         return;
     }
 
     uint16_t mod = sc_sdl_mod_normalize(SDL_GetModState());
     if (sc_shortcut_mods_is_shortcut_mod(im->sdl_shortcut_mods, mod)) {
-        // A shortcut must never generate text events
         return;
     }
 
@@ -413,10 +404,6 @@ inverse_point(struct sc_point point, struct sc_size size,
 static void
 sc_input_manager_process_key(struct sc_input_manager *im,
                              const SDL_KeyboardEvent *event) {
-    // some key events do not interact with the device, so process the event
-    // even if control is disabled
-
-    // controller is NULL if --no-control is requested
     bool control = im->controller;
     bool paused = im->screen->paused;
     bool video = im->screen->video;
@@ -429,10 +416,6 @@ sc_input_manager_process_key(struct sc_input_manager *im,
     bool shift = mod & SDL_KMOD_SHIFT;
     bool repeat = event->repeat;
 
-    // Either the modifier includes a shortcut modifier, or the key
-    // press/release is a modifier key.
-    // The second condition is necessary to ignore the release of the modifier
-    // key (because in this case mod is 0).
     uint16_t mods = im->sdl_shortcut_mods;
     bool is_shortcut = sc_shortcut_mods_is_shortcut_mod(mods, mod)
                     || sc_shortcut_mods_is_shortcut_key(mods, sdl_keycode);
@@ -447,7 +430,6 @@ sc_input_manager_process_key(struct sc_input_manager *im,
         }
     }
 
-    // Shortcuts that do not involve the MOD key
     switch (sdl_keycode) {
         case SDLK_F11:
             if (video && !repeat && down) {
@@ -469,17 +451,14 @@ sc_input_manager_process_key(struct sc_input_manager *im,
                 }
                 return;
             case SDLK_DOWN:
-                // Only capture if shift is set
                 if (shift) {
                     if (video && !repeat && down) {
-                        apply_orientation_transform(im,
-                                                    SC_ORIENTATION_FLIP_180);
+                        apply_orientation_transform(im, SC_ORIENTATION_FLIP_180);
                     }
                     return;
                 }
                 break;
             case SDLK_UP:
-                // Only capture if shift is set
                 if (shift) {
                     if (video && !repeat && down) {
                         apply_orientation_transform(im, SC_ORIENTATION_FLIP_180);
@@ -510,6 +489,49 @@ sc_input_manager_process_key(struct sc_input_manager *im,
                     sc_screen_toggle_fullscreen(im->screen);
                 }
                 return;
+            case SDLK_U: // <-- NOSSO ATALHO PIP AQUI (Alt + U)
+                if (video && !shift && !repeat && down) {
+                    sc_screen_toggle_pip(im->screen);
+                }
+                return;
+            case SDLK_L:
+                if (video && !shift && !repeat && down) {
+                    sc_screen_toggle_pip_lock(im->screen);
+                }
+                return;
+            case SDLK_A:
+                if (video && !shift && !repeat && down) {
+                    SDL_Window *window = im->screen->window;
+                    bool is_on_top =
+                        SDL_GetWindowFlags(window) & SDL_WINDOW_ALWAYS_ON_TOP;
+                    bool ok = SDL_SetWindowAlwaysOnTop(window, !is_on_top);
+                    if (!ok) {
+                        LOGW("Could not toggle always-on-top: %s",
+                             SDL_GetError());
+                    } else {
+                        LOGI("Always on top: %s",
+                             !is_on_top ? "ON" : "OFF");
+                    }
+                }
+                return;
+            case SDLK_P:
+                if (video && shift) {
+                    if (!repeat && down) {
+                        sc_screen_toggle_click_through(im->screen);
+                    }
+                    return;
+                }
+                break;
+            case SDLK_5:
+                if (video && !shift && !repeat && down) {
+                    sc_screen_set_quick_resolution(im->screen, 720);
+                }
+                return;
+            case SDLK_6:
+                if (video && !shift && !repeat && down) {
+                    sc_screen_set_quick_resolution(im->screen, 1080);
+                }
+                return;
             case SDLK_W:
                 if (video && !shift && !repeat && down) {
                     sc_screen_resize_to_fit(im->screen);
@@ -531,17 +553,12 @@ sc_input_manager_process_key(struct sc_input_manager *im,
         }
 
         if (disconnected) {
-            // Only handle shortcuts that do not interact with the device (since
-            // it is disconnected)
             return;
         }
 
-        // Flatten conditions to avoid additional indentation levels
         if (control) {
-            // Controls for all sources
             switch (sdl_keycode) {
                 case SDLK_R:
-                    // Only capture if shift is set
                     if (shift) {
                         if (!repeat && down && !paused) {
                             reset_video(im);
@@ -559,7 +576,7 @@ sc_input_manager_process_key(struct sc_input_manager *im,
                         action_home(im, action);
                     }
                     return;
-                case SDLK_B: // fall-through
+                case SDLK_B:
                 case SDLK_BACKSPACE:
                     if (im->kp && !shift && !repeat && !paused) {
                         action_back(im, action);
@@ -588,13 +605,11 @@ sc_input_manager_process_key(struct sc_input_manager *im,
                     return;
                 case SDLK_DOWN:
                     if (im->kp && !shift && !paused) {
-                        // forward repeated events
                         action_volume_down(im, action);
                     }
                     return;
                 case SDLK_UP:
                     if (im->kp && !shift && !paused) {
-                        // forward repeated events
                         action_volume_up(im, action);
                     }
                     return;
@@ -611,11 +626,8 @@ sc_input_manager_process_key(struct sc_input_manager *im,
                 case SDLK_V:
                     if (im->kp && !repeat && down && !paused) {
                         if (shift || im->legacy_paste) {
-                            // inject the text as input events
                             clipboard_paste(im);
                         } else {
-                            // store the text in the device clipboard and paste,
-                            // without requesting an acknowledgment
                             set_device_clipboard(im, true, SC_SEQUENCE_INVALID);
                         }
                     }
@@ -639,7 +651,6 @@ sc_input_manager_process_key(struct sc_input_manager *im,
                 case SDLK_K:
                     if (!shift && !repeat && down && !paused
                             && im->kp && im->kp->hid) {
-                        // Only if the current keyboard is hid
                         open_hard_keyboard_settings(im);
                     }
                     return;
@@ -655,13 +666,11 @@ sc_input_manager_process_key(struct sc_input_manager *im,
                     return;
                 case SDLK_DOWN:
                     if (!shift && down && !paused) {
-                        // forward repeated events
                         camera_zoom_out(im);
                     }
                     return;
                 case SDLK_UP:
                     if (!shift && down && !paused) {
-                        // forward repeated events
                         camera_zoom_in(im);
                     }
                     return;
@@ -681,17 +690,13 @@ sc_input_manager_process_key(struct sc_input_manager *im,
     bool is_ctrl_v = ctrl && !shift && sdl_keycode == SDLK_V && down && !repeat;
     if (im->clipboard_autosync && is_ctrl_v) {
         if (im->legacy_paste) {
-            // inject the text as input events
             clipboard_paste(im);
             return;
         }
 
-        // Request an acknowledgement only if necessary
         uint64_t sequence = im->kp->async_paste ? im->next_sequence
                                                 : SC_SEQUENCE_INVALID;
 
-        // Synchronize the computer clipboard to the device clipboard before
-        // sending Ctrl+v, to allow seamless copy-paste.
         bool ok = set_device_clipboard(im, false, sequence);
         if (!ok) {
             LOGW("Clipboard could not be synchronized, Ctrl+v not injected");
@@ -699,16 +704,12 @@ sc_input_manager_process_key(struct sc_input_manager *im,
         }
 
         if (im->kp->async_paste) {
-            // The key processor must wait for this ack before injecting Ctrl+v
             ack_to_wait = sequence;
-            // Increment only when the request succeeded
             ++im->next_sequence;
         }
     }
 
     enum sc_keycode keycode = sc_keycode_from_sdl(sdl_keycode);
-    // Accept SC_KEYCODE_UNKNOWN, as long as the physical scancode is known
-
     enum sc_scancode scancode = sc_scancode_from_sdl(event->scancode);
     if (scancode == SC_SCANCODE_UNKNOWN) {
         return;
@@ -730,7 +731,6 @@ static struct sc_position
 sc_input_manager_get_position(struct sc_input_manager *im, int32_t x,
                                                            int32_t y) {
     if (im->mp->relative_mode) {
-        // No absolute position
         return (struct sc_position) {
             .screen_size = {0, 0},
             .point = {0, 0},
@@ -751,7 +751,6 @@ sc_input_manager_process_mouse_motion(struct sc_input_manager *im,
     }
 
     if (event->which == SDL_TOUCH_MOUSEID) {
-        // simulated from touch events, so it's a duplicate
         return;
     }
 
@@ -767,11 +766,10 @@ sc_input_manager_process_mouse_motion(struct sc_input_manager *im,
     assert(im->mp->ops->process_mouse_motion);
     im->mp->ops->process_mouse_motion(im->mp, &evt);
 
-    // vfinger must never be used in relative mode
     assert(!im->mp->relative_mode || !im->vfinger_down);
 
     if (im->vfinger_down) {
-        assert(!im->mp->relative_mode); // assert one more time
+        assert(!im->mp->relative_mode);
         struct sc_point mouse =
            sc_screen_convert_window_to_frame_coords(im->screen, event->x,
                                                     event->y);
@@ -790,13 +788,11 @@ sc_input_manager_process_touch(struct sc_input_manager *im,
     }
 
     if (!im->mp->ops->process_touch) {
-        // The mouse processor does not support touch events
         return;
     }
 
     struct sc_size window_size = sc_sdl_get_window_size(im->screen->window);
 
-    // SDL touch event coordinates are normalized in the range [0; 1]
     int32_t x = event->x * (int32_t) window_size.width;
     int32_t y = event->y * (int32_t) window_size.height;
 
@@ -836,15 +832,11 @@ sc_input_manager_get_binding(const struct sc_mouse_binding_set *bindings,
 static void
 sc_input_manager_process_mouse_button(struct sc_input_manager *im,
                                       const SDL_MouseButtonEvent *event) {
-    // some mouse events do not interact with the device, so process the event
-    // even if control is disabled
-
     if (im->camera || im->disconnected) {
         return;
     }
 
     if (event->which == SDL_TOUCH_MOUSEID) {
-        // simulated from touch events, so it's a duplicate
         return;
     }
 
@@ -858,8 +850,61 @@ sc_input_manager_process_mouse_button(struct sc_input_manager *im,
     }
 
     if (!down) {
-        // Mark the button as released
         im->mouse_buttons_state &= ~button;
+    }
+
+    if (im->pip_button != SC_PIP_BUTTON_NONE) {
+        if (!down) {
+            if (im->controller && im->kp && !im->camera) {
+                enum sc_action action = SC_ACTION_UP;
+                switch (im->pip_button) {
+                    case SC_PIP_BUTTON_HOME:
+                        action_home(im, action);
+                        break;
+                    case SC_PIP_BUTTON_BACK:
+                        action_back(im, action);
+                        break;
+                    case SC_PIP_BUTTON_APP_SWITCH:
+                        action_app_switch(im, action);
+                        break;
+                    case SC_PIP_BUTTON_NONE:
+                        assert(false);
+                        break;
+                }
+            }
+            im->pip_button = SC_PIP_BUTTON_NONE;
+        }
+        return;
+    }
+
+    if (down && event->button == SDL_BUTTON_LEFT
+            && im->screen->pip_active && im->screen->controller
+            && event->y >= 0 && event->y < 40) {
+        int width;
+        int height;
+        if (SDL_GetWindowSize(im->screen->window, &width, &height)
+                && width > 0 && event->x >= 0 && event->x < width) {
+            unsigned index = (unsigned) (event->x * 3 / width);
+            im->pip_button = (enum sc_pip_button) (index + 1);
+            if (im->controller && im->kp && !im->camera) {
+                enum sc_action action = SC_ACTION_DOWN;
+                switch (im->pip_button) {
+                    case SC_PIP_BUTTON_HOME:
+                        action_home(im, action);
+                        break;
+                    case SC_PIP_BUTTON_BACK:
+                        action_back(im, action);
+                        break;
+                    case SC_PIP_BUTTON_APP_SWITCH:
+                        action_app_switch(im, action);
+                        break;
+                    case SC_PIP_BUTTON_NONE:
+                        assert(false);
+                        break;
+                }
+            }
+            return;
+        }
     }
 
     SDL_Keymod keymod = SDL_GetModState();
@@ -877,7 +922,6 @@ sc_input_manager_process_mouse_button(struct sc_input_manager *im,
         assert(binding != SC_MOUSE_BINDING_AUTO);
         switch (binding) {
             case SC_MOUSE_BINDING_DISABLED:
-                // ignore click
                 return;
             case SC_MOUSE_BINDING_BACK:
                 if (im->kp) {
@@ -909,7 +953,6 @@ sc_input_manager_process_mouse_button(struct sc_input_manager *im,
         }
     }
 
-    // double-click on black borders resizes to fit the device screen
     bool video = im->screen->video;
     bool mouse_relative_mode = im->mp && im->mp->relative_mode;
     if (video && !mouse_relative_mode && event->button == SDL_BUTTON_LEFT
@@ -932,7 +975,6 @@ sc_input_manager_process_mouse_button(struct sc_input_manager *im,
     }
 
     if (down) {
-        // Mark the button as pressed
         im->mouse_buttons_state |= button;
     }
 
@@ -954,42 +996,15 @@ sc_input_manager_process_mouse_button(struct sc_input_manager *im,
     im->mp->ops->process_mouse_click(im->mp, &evt);
 
     if (im->mp->relative_mode) {
-        assert(!im->vfinger_down); // vfinger must not be used in relative mode
-        // No pinch-to-zoom simulation
+        assert(!im->vfinger_down);
         return;
     }
 
-    // Pinch-to-zoom, rotate and tilt simulation.
-    //
-    // If Ctrl is hold when the left-click button is pressed, then
-    // pinch-to-zoom mode is enabled: on every mouse event until the left-click
-    // button is released, an additional "virtual finger" event is generated,
-    // having a position inverted through the center of the screen.
-    //
-    // In other words, the center of the rotation/scaling is the center of the
-    // screen.
-    //
-    // To simulate a vertical tilt gesture (a vertical slide with two fingers),
-    // Shift can be used instead of Ctrl. The "virtual finger" has a position
-    // inverted with respect to the vertical axis of symmetry in the middle of
-    // the screen.
-    //
-    // To simulate a horizontal tilt gesture (a horizontal slide with two
-    // fingers), Ctrl+Shift can be used. The "virtual finger" has a position
-    // inverted with respect to the horizontal axis of symmetry in the middle
-    // of the screen. It is expected to be less frequently used, that's why the
-    // one-mod shortcuts are assigned to rotation and vertical tilt.
     if (change_vfinger) {
         struct sc_point mouse =
             sc_screen_convert_window_to_frame_coords(im->screen, event->x,
                                                                  event->y);
         if (down) {
-            // Ctrl  Shift     invert_x  invert_y
-            // ----  ----- ==> --------  --------
-            //   0     0           0         0      -
-            //   0     1           1         0      vertical tilt
-            //   1     0           1         1      rotate
-            //   1     1           0         1      horizontal tilt
             im->vfinger_invert_x = ctrl_pressed ^ shift_pressed;
             im->vfinger_invert_y = ctrl_pressed;
         }
@@ -1014,15 +1029,13 @@ sc_input_manager_process_mouse_wheel(struct sc_input_manager *im,
     }
 
     if (!im->mp->ops->process_mouse_scroll) {
-        // The mouse processor does not support scroll events
         return;
     }
 
-    // mouse_x and mouse_y are expressed in pixels relative to the window
     float mouse_x;
     float mouse_y;
     uint32_t buttons = SDL_GetMouseState(&mouse_x, &mouse_y);
-    (void) buttons; // Actual buttons are tracked manually to ignore shortcuts
+    (void) buttons;
 
     struct sc_mouse_scroll_event evt = {
         .position = sc_input_manager_get_position(im, mouse_x, mouse_y),
@@ -1037,8 +1050,6 @@ sc_input_manager_process_mouse_wheel(struct sc_input_manager *im,
 static void
 sc_input_manager_process_gamepad_device(struct sc_input_manager *im,
                                        const SDL_GamepadDeviceEvent *event) {
-    // Handle device added or removed even if paused
-
     if (im->camera || !im->gp || im->disconnected) {
         return;
     }
@@ -1076,7 +1087,6 @@ sc_input_manager_process_gamepad_device(struct sc_input_manager *im,
         };
         im->gp->ops->process_gamepad_removed(im->gp, &evt);
     } else {
-        // Nothing to do
         return;
     }
 }

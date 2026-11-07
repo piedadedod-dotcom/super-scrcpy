@@ -1,0 +1,91 @@
+﻿{
+    "name":  "super-scrcpy-gui",
+    "version":  "1.0.0",
+    "private":  true,
+    "description":  "A desktop dashboard for launching scrcpy",
+    "main":  "main.js",
+    "scripts":  {
+                    "start":  "electron .",
+                    "test":  "node --test",
+                    "build":  "npm run dist",
+                    "dist":  "electron-builder --win portable nsis --x64",
+                    "dist:portable":  "electron-builder --win portable --x64",
+                    "dist:nsis":  "electron-builder --win nsis --x64"
+                },
+    "devDependencies":  {
+                            "electron":  "^45.2.3",
+                            "electron-builder":  "^26.18.0"
+                        },
+    "dependencies":  {
+                         "chart.js":  "^4.6.1",
+                         "electron-store":  "^12.0.0",
+                         "qrcode":  "^1.5.4"
+                     },
+    "build":  {
+                  "appId":  "com.super-scrcpy.gui",
+                  "productName":  "Super Scrcpy",
+                  "directories":  {
+                                      "output":  "dist"
+                                  },
+                  "win":  {
+                              "target":  [
+                                             {
+                                                 "target":  "portable",
+                                                 "arch":  [
+                                                              "x64"
+                                                          ]
+                                             },
+                                             {
+                                                 "target":  "nsis",
+                                                 "arch":  [
+                                                              "x64"
+                                                          ]
+                                             }
+                                         ]
+                          },
+                  "portable":  {
+                                   "artifactName":  "${productName}-${version}-portable.${ext}"
+                               },
+                  "nsis":  {
+                               "artifactName":  "${productName}-${version}-setup.${ext}",
+                               "oneClick":  false,
+                               "allowToChangeInstallationDirectory":  true,
+                               "createDesktopShortcut":  true,
+                               "createStartMenuShortcut":  true,
+                               "shortcutName":  "Super Scrcpy"
+                           },
+                  "extraResources":  [
+                                         {
+                                             "from":  "../x/app",
+                                             "to":  "x/app"
+                                         },
+                                         {
+                                             "from":  "../scrcpy-server-v5.0.1",
+                                             "to":  "scrcpy-server-v5.0.1"
+                                         },
+                                         {
+                                             "from":  "../../../../ucrt64/bin",
+                                             "to":  "platform-tools",
+                                             "filter":  [
+                                                            "adb.exe",
+                                                            "AdbWin*.dll",
+                                                            "libabsl_*.dll",
+                                                            "libbrotli*.dll",
+                                                            "libgcc_s_seh-1.dll",
+                                                            "liblz4.dll",
+                                                            "libprotobuf.dll",
+                                                            "libstdc++-6.dll",
+                                                            "libutf8_validity.dll",
+                                                            "libwinpthread-1.dll",
+                                                            "libzstd.dll",
+                                                            "zlib1.dll"
+                                                        ]
+                                         },
+                                         {
+                                             "from":  "assets/super-scrcpy-tray.png",
+                                             "to":  "assets/super-scrcpy-tray.png"
+                                         }
+                                     ],
+                  "icon":  "build/icon.ico"
+              }
+}
